@@ -3,11 +3,12 @@
 #include "repository.h"
 #include "fsmonitor-settings.h"
 #include "fsmonitor.h"
+#include "fsmonitor-ipc.h"
 #include <sys/param.h>
 #include <sys/mount.h>
 
 /*
- * [1] Remote working directories are problematic for FSMonitor.
+ * Remote working directories are problematic for FSMonitor.
  *
  * The underlying file system on the server machine and/or the remote
  * mount type (NFS, SAMBA, etc.) dictates whether notification events
@@ -27,26 +28,8 @@
  * In theory, the above issues need to be addressed whether we are
  * using the Hook or IPC API.
  *
- * For the builtin FSMonitor, we create the Unix domain socket for the
- * IPC in the .git directory.  If the working directory is remote,
- * then the socket will be created on the remote file system.  This
- * can fail if the remote file system does not support UDS file types
- * (e.g. smbfs to a Windows server) or if the remote kernel does not
- * allow a non-local process to bind() the socket.  (These problems
- * could be fixed by moving the UDS out of the .git directory and to a
- * well-known local directory on the client machine, but care should
- * be taken to ensure that $HOME is actually local and not a managed
- * file share.)
- *
  * So (for now at least), mark remote working directories as
- * incompatible.
- *
- *
- * [2] FAT32 and NTFS working directories are problematic too.
- *
- * The builtin FSMonitor uses a Unix domain socket in the .git
- * directory for IPC.  These Windows drive formats do not support
- * Unix domain sockets, so mark them as incompatible for the daemon.
+ * incompatible unless fsmonitor.allowRemote is true.
  *
  */
 static enum fsmonitor_reason check_volume(struct repository *r)
@@ -65,6 +48,51 @@ static enum fsmonitor_reason check_volume(struct repository *r)
 			 "statfs('%s') [type 0x%08x][flags 0x%08x] '%s'",
 			 r->worktree, fs.f_type, fs.f_flags, fs.f_fstypename);
 
+	if (!(fs.f_flags & MNT_LOCAL)
+		&& (fsm_settings__get_allow_remote(r) < 1))
+			return FSMONITOR_REASON_REMOTE;
+
+	return FSMONITOR_REASON_OK;
+}
+
+/*
+ * For the builtin FSMonitor, we create the Unix domain socket (UDS)
+ * for the IPC in the .git directory by default or $HOME if
+ * fsmonitor.allowRemote is true.  If the directory is remote,
+ * then the socket will be created on the remote file system. This
+ * can fail if the remote file system does not support UDS file types
+ * (e.g. smbfs to a Windows server) or if the remote kernel does not
+ * allow a non-local process to bind() the socket.
+ *
+ * Therefore remote UDS locations are marked as incompatible.
+ *
+ * FAT32 and NTFS working directories are problematic too.
+ *
+ * These Windows drive formats do not support Unix domain sockets, so
+ * mark them as incompatible for the location of the UDS file.
+ *
+ */
+static enum fsmonitor_reason check_uds_volume(void)
+{
+	struct statfs fs;
+	struct strbuf path = STRBUF_INIT;
+	const char *ipc_path = fsmonitor_ipc__get_path();
+	strbuf_add(&path, ipc_path, strlen(ipc_path));
+
+	if (statfs(dirname(path.buf), &fs) == -1) {
+		int saved_errno = errno;
+		trace_printf_key(&trace_fsmonitor, "statfs('%s') failed: %s",
+				 path.buf, strerror(saved_errno));
+		errno = saved_errno;
+		strbuf_release(&path);
+		return FSMONITOR_REASON_ERROR;
+	}
+
+	trace_printf_key(&trace_fsmonitor,
+			 "statfs('%s') [type 0x%08x][flags 0x%08x] '%s'",
+			 path.buf, fs.f_type, fs.f_flags, fs.f_fstypename);
+	strbuf_release(&path);
+
 	if (!(fs.f_flags & MNT_LOCAL))
 		return FSMONITOR_REASON_REMOTE;
 
@@ -82,6 +110,10 @@ enum fsmonitor_reason fsm_os__incompatible(struct repository *r)
 	enum fsmonitor_reason reason;
 
 	reason = check_volume(r);
+	if (reason != FSMONITOR_REASON_OK)
+		return reason;
+
+	reason = check_uds_volume();
 	if (reason != FSMONITOR_REASON_OK)
 		return reason;
 

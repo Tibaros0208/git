@@ -1,7 +1,6 @@
 #include "cache.h"
-#include "fsmonitor.h"
-#include "simple-ipc.h"
 #include "fsmonitor-ipc.h"
+#include "fsmonitor-settings.h"
 #include "run-command.h"
 #include "strbuf.h"
 #include "trace2.h"
@@ -47,7 +46,42 @@ int fsmonitor_ipc__is_supported(void)
 	return 1;
 }
 
-GIT_PATH_FUNC(fsmonitor_ipc__get_path, "fsmonitor--daemon.ipc")
+GIT_PATH_FUNC(fsmonitor_ipc__get_default_path, "fsmonitor--daemon.ipc")
+
+const char *fsmonitor_ipc__get_path(void)
+{
+#ifdef WIN32
+	return fsmonitor_ipc__get_default_path();
+#else
+	char *retval;
+	SHA_CTX sha1ctx;
+	const char *git_dir;
+	const char *sock_dir;
+	struct strbuf ipc_file = STRBUF_INIT;
+	unsigned char hash[SHA_DIGEST_LENGTH];
+
+	if (fsm_settings__get_allow_remote(the_repository) < 1)
+		return fsmonitor_ipc__get_default_path();
+
+	git_dir = get_git_dir();
+	sock_dir = fsm_settings__get_socket_dir(the_repository);
+
+	SHA1_Init(&sha1ctx);
+	SHA1_Update(&sha1ctx, git_dir, strlen(git_dir));
+	SHA1_Final(hash, &sha1ctx);
+
+	if (sock_dir && *sock_dir)
+		strbuf_addf(&ipc_file, "%s/.git-fsmonitor-%s",
+					sock_dir, hash_to_hex(hash));
+	else
+		strbuf_addf(&ipc_file, "~/.git-fsmonitor-%s", hash_to_hex(hash));
+	retval = interpolate_path(ipc_file.buf, 1);
+	if (!retval)
+		die(_("Invalid path: %s"), ipc_file.buf);
+	strbuf_release(&ipc_file);
+	return retval;
+#endif
+}
 
 enum ipc_active_state fsmonitor_ipc__get_state(void)
 {

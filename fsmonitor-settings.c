@@ -10,7 +10,9 @@
 struct fsmonitor_settings {
 	enum fsmonitor_mode mode;
 	enum fsmonitor_reason reason;
+	int allow_remote;
 	char *hook_path;
+	char *sock_dir;
 };
 
 static enum fsmonitor_reason check_for_incompatible(struct repository *r)
@@ -43,6 +45,7 @@ static struct fsmonitor_settings *alloc_settings(void)
 	CALLOC_ARRAY(s, 1);
 	s->mode = FSMONITOR_MODE_DISABLED;
 	s->reason = FSMONITOR_REASON_UNTESTED;
+	s->allow_remote = -1;
 
 	return s;
 }
@@ -90,6 +93,26 @@ static void lookup_fsmonitor_settings(struct repository *r)
 		fsm_settings__set_disabled(r);
 }
 
+int fsm_settings__get_allow_remote(struct repository *r)
+{
+	if (!r)
+		r = the_repository;
+	if (!r->settings.fsmonitor)
+		lookup_fsmonitor_settings(r);
+
+	return r->settings.fsmonitor->allow_remote;
+}
+
+const char *fsm_settings__get_socket_dir(struct repository *r)
+{
+	if (!r)
+		r = the_repository;
+	if (!r->settings.fsmonitor)
+		lookup_fsmonitor_settings(r);
+
+	return r->settings.fsmonitor->sock_dir;
+}
+
 enum fsmonitor_mode fsm_settings__get_mode(struct repository *r)
 {
 	if (!r)
@@ -99,6 +122,7 @@ enum fsmonitor_mode fsm_settings__get_mode(struct repository *r)
 
 	return r->settings.fsmonitor->mode;
 }
+
 
 const char *fsm_settings__get_hook_path(struct repository *r)
 {
@@ -110,9 +134,44 @@ const char *fsm_settings__get_hook_path(struct repository *r)
 	return r->settings.fsmonitor->hook_path;
 }
 
+void fsm_settings__set_allow_remote(struct repository *r)
+{
+	int allow;
+
+	if (!r)
+		r = the_repository;
+	if (!r->settings.fsmonitor)
+		r->settings.fsmonitor = alloc_settings();
+	if (!repo_config_get_bool(r, "fsmonitor.allowremote", &allow))
+		r->settings.fsmonitor->allow_remote = allow;
+
+	return;
+}
+
+void fsm_settings__set_socket_dir(struct repository *r)
+{
+	const char *path;
+
+	if (!r)
+		r = the_repository;
+	if (!r->settings.fsmonitor)
+		r->settings.fsmonitor = alloc_settings();
+
+	if (!repo_config_get_pathname(r, "fsmonitor.socketdir", &path)) {
+		FREE_AND_NULL(r->settings.fsmonitor->sock_dir);
+		r->settings.fsmonitor->sock_dir = strdup(path);
+	}
+
+	return;
+}
+
 void fsm_settings__set_ipc(struct repository *r)
 {
-	enum fsmonitor_reason reason = check_for_incompatible(r);
+	enum fsmonitor_reason reason;
+
+	fsm_settings__set_allow_remote(r);
+	fsm_settings__set_socket_dir(r);
+	reason = check_for_incompatible(r);
 
 	if (reason != FSMONITOR_REASON_OK) {
 		fsm_settings__set_incompatible(r, reason);
@@ -135,7 +194,11 @@ void fsm_settings__set_ipc(struct repository *r)
 
 void fsm_settings__set_hook(struct repository *r, const char *path)
 {
-	enum fsmonitor_reason reason = check_for_incompatible(r);
+	enum fsmonitor_reason reason;
+
+	fsm_settings__set_allow_remote(r);
+	fsm_settings__set_socket_dir(r);
+	reason = check_for_incompatible(r);
 
 	if (reason != FSMONITOR_REASON_OK) {
 		fsm_settings__set_incompatible(r, reason);
