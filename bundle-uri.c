@@ -4,6 +4,203 @@
 #include "object-store.h"
 #include "refs.h"
 #include "run-command.h"
+#include "hashmap.h"
+#include "pkt-line.h"
+#include "config.h"
+
+static int compare_bundles(const void *hashmap_cmp_fn_data,
+			   const struct hashmap_entry *he1,
+			   const struct hashmap_entry *he2,
+			   const void *id)
+{
+	const struct remote_bundle_info *e1 =
+		container_of(he1, const struct remote_bundle_info, ent);
+	const struct remote_bundle_info *e2 =
+		container_of(he2, const struct remote_bundle_info, ent);
+
+	return strcmp(e1->id, id ? (const char *)id : e2->id);
+}
+
+void init_bundle_list(struct bundle_list *list)
+{
+	memset(list, 0, sizeof(*list));
+
+	/* Implied defaults. */
+	list->mode = BUNDLE_MODE_ALL;
+	list->version = 1;
+
+	hashmap_init(&list->bundles, compare_bundles, NULL, 0);
+}
+
+static int clear_remote_bundle_info(struct remote_bundle_info *bundle,
+				    void *data)
+{
+	FREE_AND_NULL(bundle->id);
+	FREE_AND_NULL(bundle->uri);
+	strbuf_release(&bundle->file);
+	bundle->unbundled = 0;
+	return 0;
+}
+
+void clear_bundle_list(struct bundle_list *list)
+{
+	if (!list)
+		return;
+
+	for_all_bundles_in_list(list, clear_remote_bundle_info, NULL);
+	hashmap_clear_and_free(&list->bundles, struct remote_bundle_info, ent);
+}
+
+int for_all_bundles_in_list(struct bundle_list *list,
+			    bundle_iterator iter,
+			    void *data)
+{
+	struct remote_bundle_info *info;
+	struct hashmap_iter i;
+
+	hashmap_for_each_entry(&list->bundles, &i, info, ent) {
+		int result = iter(info, data);
+
+		if (result)
+			return result;
+	}
+
+	return 0;
+}
+
+static int summarize_bundle(struct remote_bundle_info *info, void *data)
+{
+	FILE *fp = data;
+	fprintf(fp, "[bundle \"%s\"]\n", info->id);
+	fprintf(fp, "\turi = %s\n", info->uri);
+	return 0;
+}
+
+void print_bundle_list(FILE *fp, struct bundle_list *list)
+{
+	const char *mode;
+
+	switch (list->mode) {
+	case BUNDLE_MODE_ALL:
+		mode = "all";
+		break;
+
+	case BUNDLE_MODE_ANY:
+		mode = "any";
+		break;
+
+	case BUNDLE_MODE_NONE:
+	default:
+		mode = "<unknown>";
+	}
+
+	printf("[bundle]\n");
+	printf("\tversion = %d\n", list->version);
+	printf("\tmode = %s\n", mode);
+
+	for_all_bundles_in_list(list, summarize_bundle, fp);
+}
+
+/**
+ * Given a key-value pair, update the state of the given bundle list.
+ * Returns 0 if the key-value pair is understood. Returns 1 if the key
+ * is not understood or the value is malformed.
+ */
+static int bundle_list_update(const char *key, const char *value,
+			      struct bundle_list *list)
+{
+	const char *pkey, *dot;
+	struct strbuf id = STRBUF_INIT;
+	struct remote_bundle_info lookup = REMOTE_BUNDLE_INFO_INIT;
+	struct remote_bundle_info *bundle;
+
+	if (!skip_prefix(key, "bundle.", &pkey))
+		return 1;
+
+	dot = strchr(pkey, '.');
+	if (!dot) {
+		if (!strcmp(pkey, "version")) {
+			int version = atoi(value);
+			if (version != 1)
+				return 1;
+
+			list->version = version;
+			return 0;
+		}
+
+		if (!strcmp(pkey, "mode")) {
+			if (!strcmp(value, "all"))
+				list->mode = BUNDLE_MODE_ALL;
+			else if (!strcmp(value, "any"))
+				list->mode = BUNDLE_MODE_ANY;
+			else
+				return 1;
+			return 0;
+		}
+
+		/* Ignore other unknown global keys. */
+		return 0;
+	}
+
+	strbuf_add(&id, pkey, dot - pkey);
+	dot++;
+
+	/*
+	 * Check for an existing bundle with this <id>, or create one
+	 * if necessary.
+	 */
+	lookup.id = id.buf;
+	hashmap_entry_init(&lookup.ent, strhash(lookup.id));
+	if (!(bundle = hashmap_get_entry(&list->bundles, &lookup, ent, NULL))) {
+		CALLOC_ARRAY(bundle, 1);
+		bundle->id = strbuf_detach(&id, NULL);
+		strbuf_init(&bundle->file, 0);
+		hashmap_entry_init(&bundle->ent, strhash(bundle->id));
+		hashmap_add(&list->bundles, &bundle->ent);
+	}
+	strbuf_release(&id);
+
+	if (!strcmp(dot, "uri")) {
+		free(bundle->uri);
+		bundle->uri = xstrdup(value);
+		return 0;
+	}
+
+	/*
+	 * At this point, we ignore any information that we don't
+	 * understand, assuming it to be hints for a heuristic the client
+	 * does not currently understand.
+	 */
+	return 0;
+}
+
+static int config_to_bundle_list(const char *key, const char *value, void *data)
+{
+	struct bundle_list *list = data;
+	return bundle_list_update(key, value, list);
+}
+
+int parse_bundle_list_in_config_format(const char *uri,
+				       const char *filename,
+				       struct bundle_list *list)
+{
+	int result;
+	struct config_options opts = {
+		.error_action = CONFIG_ERROR_ERROR,
+	};
+
+	list->mode = BUNDLE_MODE_NONE;
+	result = git_config_from_file_with_options(config_to_bundle_list,
+						   filename, list,
+						   &opts);
+
+	if (!result && list->mode == BUNDLE_MODE_NONE) {
+		warning(_("bundle list at '%s' has no mode"), uri);
+		result = 1;
+	}
+
+	return result;
+}
 
 static int find_temp_filename(struct strbuf *name)
 {
@@ -138,31 +335,252 @@ static int unbundle_from_file(struct repository *r, const char *file)
 	return result;
 }
 
-int fetch_bundle_uri(struct repository *r, const char *uri)
+struct bundle_list_context {
+	struct repository *r;
+	struct bundle_list *list;
+	enum bundle_list_mode mode;
+	int count;
+	int depth;
+};
+
+/*
+ * This early definition is necessary because we use indirect recursion:
+ *
+ * While iterating through a bundle list that was downloaded as part
+ * of fetch_bundle_uri_internal(), iterator methods eventually call it
+ * again, but with depth + 1.
+ */
+static int fetch_bundle_uri_internal(struct repository *r,
+				     struct remote_bundle_info *bundle,
+				     int depth,
+				     struct bundle_list *list);
+
+static int download_bundle_to_file(struct remote_bundle_info *bundle, void *data)
 {
-	int result = 0;
-	struct strbuf filename = STRBUF_INIT;
+	struct bundle_list_context *ctx = data;
 
-	if ((result = find_temp_filename(&filename)))
+	if (ctx->mode == BUNDLE_MODE_ANY && ctx->count)
+		return 0;
+
+	ctx->count++;
+	return fetch_bundle_uri_internal(ctx->r, bundle, ctx->depth + 1, ctx->list);
+}
+
+static int download_bundle_list(struct repository *r,
+				struct bundle_list *local_list,
+				struct bundle_list *global_list,
+				int depth)
+{
+	struct bundle_list_context ctx = {
+		.r = r,
+		.list = global_list,
+		.depth = depth + 1,
+		.mode = local_list->mode,
+	};
+
+	return for_all_bundles_in_list(local_list, download_bundle_to_file, &ctx);
+}
+
+static int fetch_bundle_list_in_config_format(struct repository *r,
+					      struct bundle_list *global_list,
+					      struct remote_bundle_info *bundle,
+					      int depth)
+{
+	int result;
+	struct bundle_list list_from_bundle;
+
+	init_bundle_list(&list_from_bundle);
+
+	if ((result = parse_bundle_list_in_config_format(bundle->uri,
+							 bundle->file.buf,
+							 &list_from_bundle)))
 		goto cleanup;
 
-	if ((result = copy_uri_to_file(filename.buf, uri))) {
-		warning(_("failed to download bundle from URI '%s'"), uri);
+	if (list_from_bundle.mode == BUNDLE_MODE_NONE) {
+		warning(_("unrecognized bundle mode from URI '%s'"),
+			bundle->uri);
+		result = -1;
 		goto cleanup;
 	}
 
-	if ((result = !is_bundle(filename.buf, 0))) {
-		warning(_("file at URI '%s' is not a bundle"), uri);
+	if ((result = download_bundle_list(r, &list_from_bundle,
+					   global_list, depth)))
 		goto cleanup;
-	}
-
-	if ((result = unbundle_from_file(r, filename.buf))) {
-		warning(_("failed to unbundle bundle from URI '%s'"), uri);
-		goto cleanup;
-	}
 
 cleanup:
-	unlink(filename.buf);
-	strbuf_release(&filename);
+	clear_bundle_list(&list_from_bundle);
+	return result;
+}
+
+/**
+ * This limits the recursion on fetch_bundle_uri_internal() when following
+ * bundle lists.
+ */
+static int max_bundle_uri_depth = 4;
+
+/**
+ * Recursively download all bundles advertised at the given URI
+ * to files. If the file is a bundle, then add it to the given
+ * 'list'. Otherwise, expect a bundle list and recurse on the
+ * URIs in that list according to the list mode (ANY or ALL).
+ */
+static int fetch_bundle_uri_internal(struct repository *r,
+				     struct remote_bundle_info *bundle,
+				     int depth,
+				     struct bundle_list *list)
+{
+	int result = 0;
+	struct remote_bundle_info *bcopy;
+
+	if (depth >= max_bundle_uri_depth) {
+		warning(_("exceeded bundle URI recursion limit (%d)"),
+			max_bundle_uri_depth);
+		return -1;
+	}
+
+	if (!bundle->file.len &&
+	    (result = find_temp_filename(&bundle->file)))
+		goto cleanup;
+
+	if ((result = copy_uri_to_file(bundle->file.buf, bundle->uri))) {
+		warning(_("failed to download bundle from URI '%s'"), bundle->uri);
+		goto cleanup;
+	}
+
+	if ((result = !is_bundle(bundle->file.buf, 1))) {
+		result = fetch_bundle_list_in_config_format(
+				r, list, bundle, depth);
+		if (result)
+			warning(_("file at URI '%s' is not a bundle or bundle list"),
+				bundle->uri);
+		goto cleanup;
+	}
+
+	/* Copy the bundle and insert it into the global list. */
+	CALLOC_ARRAY(bcopy, 1);
+	bcopy->id = xstrdup(bundle->id);
+	strbuf_init(&bcopy->file, 0);
+	strbuf_add(&bcopy->file, bundle->file.buf, bundle->file.len);
+	hashmap_entry_init(&bcopy->ent, strhash(bcopy->id));
+	hashmap_add(&list->bundles, &bcopy->ent);
+
+cleanup:
+	if (result)
+		unlink(bundle->file.buf);
+	return result;
+}
+
+struct attempt_unbundle_context {
+	struct repository *r;
+	int success_count;
+	int failure_count;
+};
+
+static int attempt_unbundle(struct remote_bundle_info *info, void *data)
+{
+	struct attempt_unbundle_context *ctx = data;
+
+	if (info->unbundled || !unbundle_from_file(ctx->r, info->file.buf)) {
+		ctx->success_count++;
+		info->unbundled = 1;
+	} else {
+		ctx->failure_count++;
+	}
+
+	return 0;
+}
+
+static int unbundle_all_bundles(struct repository *r,
+				struct bundle_list *list)
+{
+	int last_success_count = -1;
+	struct attempt_unbundle_context ctx = {
+		.r = r,
+	};
+
+	/*
+	 * Iterate through all bundles looking for ones that can
+	 * successfully unbundle. If any succeed, then perhaps another
+	 * will succeed in the next attempt.
+	 */
+	while (last_success_count < ctx.success_count) {
+		last_success_count = ctx.success_count;
+
+		ctx.success_count = 0;
+		ctx.failure_count = 0;
+		for_all_bundles_in_list(list, attempt_unbundle, &ctx);
+	}
+
+	if (ctx.success_count)
+		git_config_set_multivar_gently("log.excludedecoration",
+						"refs/bundle/",
+						"refs/bundle/",
+						CONFIG_FLAGS_FIXED_VALUE |
+						CONFIG_FLAGS_MULTI_REPLACE);
+
+	if (ctx.failure_count)
+		warning(_("failed to unbundle %d bundles"),
+			ctx.failure_count);
+
+	return 0;
+}
+
+static int unlink_bundle(struct remote_bundle_info *info, void *data)
+{
+	if (info->file.buf)
+		unlink_or_warn(info->file.buf);
+	return 0;
+}
+
+int fetch_bundle_uri(struct repository *r, const char *uri)
+{
+	int result;
+	struct bundle_list list;
+	struct remote_bundle_info bundle = {
+		.uri = xstrdup(uri),
+		.id = xstrdup("<root>"),
+		.file = STRBUF_INIT,
+	};
+
+	init_bundle_list(&list);
+
+	/* If a bundle is added to this global list, then it is required. */
+	list.mode = BUNDLE_MODE_ALL;
+
+	if ((result = fetch_bundle_uri_internal(r, &bundle, 0, &list)))
+		goto cleanup;
+
+	result = unbundle_all_bundles(r, &list);
+
+cleanup:
+	for_all_bundles_in_list(&list, unlink_bundle, NULL);
+	clear_bundle_list(&list);
+	clear_remote_bundle_info(&bundle, NULL);
+	return result;
+}
+
+/**
+ * General API for {transport,connect}.c etc.
+ */
+int bundle_uri_parse_line(struct bundle_list *list, const char *line)
+{
+	int result;
+	const char *equals;
+	struct strbuf key = STRBUF_INIT;
+
+	if (!strlen(line))
+		return error(_("bundle-uri: got an empty line"));
+
+	equals = strchr(line, '=');
+
+	if (!equals)
+		return error(_("bundle-uri: line is not of the form 'key=value'"));
+	if (line == equals || !*(equals + 1))
+		return error(_("bundle-uri: line has empty key or value"));
+
+	strbuf_add(&key, line, equals - line);
+	result = bundle_list_update(key.buf, equals + 1, list);
+	strbuf_release(&key);
+
 	return result;
 }
